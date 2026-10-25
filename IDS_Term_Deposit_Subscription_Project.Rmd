@@ -1,0 +1,508 @@
+---
+title: "Predicting Term Deposit Subscriptions Using Machine Learning in R"
+subtitle: "A Bank Marketing Analytics Approach"
+author: "[Your Name] | [Roll Number] | Introduction to Data Science"
+date: "`r format(Sys.Date(), '%d %B %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 8, fig.height = 5, out.width = "90%")
+set.seed(123)
+```
+
+# Project overview
+
+## Purpose
+
+Banks use telephone campaigns to encourage customers to subscribe to term deposits. Contacting every customer can consume staff time and campaign budget, while only a proportion of customers subscribe. This project uses historical bank-marketing data to build classification models that estimate whether a customer is likely to subscribe (`yes`) or not (`no`).
+
+The workflow is designed for **R and RStudio**: data import, inspection, preprocessing, exploratory data analysis (EDA), model training, evaluation, comparison, and business interpretation.
+
+## Research question
+
+**Can demographic, financial and campaign-related information help predict whether a customer will subscribe to a term deposit?**
+
+## Objectives
+
+1. Inspect the quality and structure of the historical data.
+2. Prepare a consistent modelling dataset and examine the target distribution.
+3. Explore how customer and campaign attributes relate to subscription.
+4. Train Logistic Regression, Decision Tree and Random Forest classifiers.
+5. Compare models using accuracy, precision, recall, F1-score and ROC-AUC.
+6. Discuss how probability-based customer ranking could support marketing decisions.
+
+## Scope
+
+This is an analytical case study, not a live banking deployment. Model results will be generated from the CSV supplied by the student; no performance numbers are assumed in advance.
+
+# Dataset description
+
+The project is based on the **UCI Bank Marketing** dataset described by Moro, Cortez and Rita (2014). It contains information from direct phone-marketing campaigns of a Portuguese banking institution.
+
+The reference file in the project materials is `bank-full.csv`, which is commonly distributed as 45,211 records with 16 input attributes and one target column. The exact version used must be confirmed from the local file; the code below prints the actual dimensions and class distribution.
+
+## Main variables
+
+| Group | Example variables | Description |
+|---|---|---|
+| Customer profile | `age`, `job`, `marital`, `education` | Basic demographic information |
+| Financial status | `default`, `balance`, `housing`, `loan` | Credit status, balance and loan indicators |
+| Current campaign | `contact`, `day`, `month`, `duration`, `campaign` | Information about the current marketing contact |
+| Previous campaign | `pdays`, `previous`, `poutcome` | History and outcome of earlier campaigns |
+| Target | `y` | Whether the customer subscribed (`yes`/`no`) |
+
+### Important modelling decision: call duration
+
+`duration` is only known after a phone call has ended. If the model is intended to prioritise customers **before** a call, using duration would leak information that would not yet be available. Therefore, this report excludes `duration` from the primary pre-call models. If a duration-inclusive benchmark is later run, it should be labelled clearly as a benchmark rather than a realistic pre-call prediction.
+
+# Packages and environment
+
+The analysis uses common R packages for data manipulation, plotting, model fitting and evaluation.
+
+```{r packages}
+required_packages <- c("ggplot2", "dplyr", "caret", "rpart",
+                       "rpart.plot", "randomForest", "pROC", "knitr")
+missing_packages <- required_packages[
+  !vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)
+]
+if (length(missing_packages) > 0) {
+  stop(
+    "Please install these packages before knitting: ",
+    paste(missing_packages, collapse = ", "),
+    ". Run install.packages(c(",
+    paste(sprintf('"%s"', missing_packages), collapse = ", "),
+    ")) in the R console."
+  )
+}
+library(ggplot2)
+library(dplyr)
+library(caret)
+library(rpart)
+library(randomForest)
+library(pROC)
+library(knitr)
+```
+
+| Package / function | Purpose in this project |
+|---|---|
+| Base R (`read.csv`, `str`, `summary`) | Import and inspect the dataset |
+| `dplyr` | Cleaning and data summaries |
+| `ggplot2` | EDA visualisations |
+| `caret` | Stratified split and confusion-matrix metrics |
+| `glm()` | Logistic Regression |
+| `rpart` | Decision Tree |
+| `randomForest` | Random Forest |
+| `pROC` | ROC curve and AUC |
+| `knitr` | Formatted tables in the report |
+
+# Import and inspect the data
+
+Place `bank-full.csv` in the same folder as this R Markdown file. The original file is semicolon-separated, so `sep = ";"` is important.
+
+```{r import}
+data_file <- "bank-full.csv"
+
+if (!file.exists(data_file)) {
+  stop("Could not find bank-full.csv. Place the dataset in the same folder as this .Rmd file, or update data_file to its path.")
+}
+
+bank_raw <- read.csv(data_file, sep = ";", stringsAsFactors = FALSE,
+                     na.strings = c(""))
+cat("Rows:", nrow(bank_raw), "| Columns:", ncol(bank_raw), "\n")
+head(bank_raw)
+```
+
+## Structure and summary
+
+```{r inspect}
+str(bank_raw)
+summary(bank_raw)
+```
+
+The dimensions and summary output describe the actual local dataset rather than assuming a particular version. Confirm that the target column is named `y`.
+
+```{r target-check}
+if (!"y" %in% names(bank_raw)) {
+  stop("The dataset must contain a target column named 'y'. Check that the correct Bank Marketing CSV was loaded.")
+}
+table(bank_raw$y, useNA = "ifany")
+prop.table(table(bank_raw$y, useNA = "ifany"))
+```
+
+The target is a binary outcome. The `yes` class is typically smaller than the `no` class, so accuracy alone may not adequately describe model performance.
+
+# Data preparation
+
+## Cleaning decisions
+
+- Convert text columns to factors so R modelling functions treat categories appropriately.
+- Keep the literal `unknown` values as a category instead of silently treating them as ordinary missing values.
+- Remove exact duplicate rows, if any, and report how many were removed.
+- Exclude `duration` from the primary model because it is not available before a call.
+- Use a stratified 70/30 train-test split so both sets retain a similar target-class proportion.
+- Do not perform resampling on the test set.
+
+```{r clean}
+n_before <- nrow(bank_raw)
+duplicate_count <- sum(duplicated(bank_raw))
+bank <- bank_raw[!duplicated(bank_raw), , drop = FALSE]
+
+cat("Rows before duplicate removal:", n_before, "\n")
+cat("Exact duplicate rows found:", duplicate_count, "\n")
+cat("Rows after duplicate removal:", nrow(bank), "\n")
+
+bank$y <- factor(tolower(trimws(bank$y)), levels = c("no", "yes"))
+bank <- bank[!is.na(bank$y), , drop = FALSE]
+
+# Convert character predictors to factors.
+char_cols <- names(bank)[vapply(bank, is.character, logical(1))]
+bank[char_cols] <- lapply(bank[char_cols], factor)
+
+# Primary pre-call feature set: remove duration to avoid post-call leakage.
+if ("duration" %in% names(bank)) {
+  bank$duration <- NULL
+}
+
+cat("Prepared dimensions:", nrow(bank), "rows x", ncol(bank), "columns\n")
+```
+
+## Missing-value check
+
+```{r missing-values}
+missing_summary <- data.frame(
+  Variable = names(bank),
+  Missing = vapply(bank, function(x) sum(is.na(x)), numeric(1)),
+  row.names = NULL
+)
+knitr::kable(missing_summary, caption = "Missing values after basic cleaning")
+```
+
+If true missing values appear in predictors, this report stops before modelling rather than silently imputing them. Review the relevant columns and decide on a documented imputation strategy.
+
+```{r missing-validation}
+if (anyNA(bank)) {
+  stop("Missing values remain in the modelling data. Review the missing-value table and add a justified imputation step before continuing.")
+}
+```
+
+# Exploratory Data Analysis
+
+## Subscription distribution
+
+```{r target-plot}
+ggplot(bank, aes(x = y, fill = y)) +
+  geom_bar() +
+  labs(title = "Term-deposit subscription distribution",
+       x = "Subscription outcome", y = "Number of customers") +
+  theme_minimal() +
+  theme(legend.position = "none")
+```
+
+```{r target-ratio}
+target_share <- prop.table(table(bank$y))
+knitr::kable(
+  data.frame(Outcome = names(target_share),
+             Proportion = as.numeric(target_share),
+             Percentage = round(100 * as.numeric(target_share), 2)),
+  caption = "Observed target-class proportions"
+)
+```
+
+## Age distribution
+
+```{r age-plot}
+if ("age" %in% names(bank)) {
+  ggplot(bank, aes(x = age, fill = y)) +
+    geom_histogram(binwidth = 5, position = "identity", alpha = 0.55) +
+    labs(title = "Customer age distribution by subscription outcome",
+         x = "Age", y = "Number of customers", fill = "Subscribed") +
+    theme_minimal()
+}
+```
+
+## Subscription rate by occupation
+
+The plot uses within-category proportions, which are more informative than raw counts when categories differ in size.
+
+```{r job-plot}
+if ("job" %in% names(bank)) {
+  job_rates <- bank %>%
+    count(job, y) %>%
+    group_by(job) %>%
+    mutate(Proportion = n / sum(n)) %>%
+    ungroup()
+
+  ggplot(job_rates, aes(x = reorder(job, Proportion), y = Proportion, fill = y)) +
+    geom_col(position = "fill") +
+    coord_flip() +
+    scale_y_continuous(labels = scales::percent) +
+    labs(title = "Subscription proportion by occupation",
+         x = "Occupation", y = "Proportion", fill = "Subscribed") +
+    theme_minimal()
+}
+```
+
+## Contact method and previous campaign outcome
+
+```{r contact-plot}
+if ("contact" %in% names(bank)) {
+  ggplot(bank, aes(x = contact, fill = y)) +
+    geom_bar(position = "fill") +
+    scale_y_continuous(labels = scales::percent) +
+    labs(title = "Subscription proportion by contact method",
+         x = "Contact method", y = "Proportion", fill = "Subscribed") +
+    theme_minimal()
+}
+```
+
+```{r previous-outcome-plot}
+if ("poutcome" %in% names(bank)) {
+  ggplot(bank, aes(x = poutcome, fill = y)) +
+    geom_bar(position = "fill") +
+    scale_y_continuous(labels = scales::percent) +
+    labs(title = "Subscription proportion by previous campaign outcome",
+         x = "Previous campaign outcome", y = "Proportion", fill = "Subscribed") +
+    theme_minimal()
+}
+```
+
+## EDA interpretation guide
+
+After knitting, interpret the plots using the observed data. Look for differences in subscription proportions by occupation, contact method and previous campaign outcome. These are associations in historical data, not proof that a variable causes subscription. Avoid writing a specific finding unless it is supported by the generated plots.
+
+# Machine-learning methodology
+
+The task is **supervised binary classification** because the historical records include a known yes/no outcome.
+
+**Workflow:** Bank Marketing CSV → inspection and cleaning → EDA → stratified split → model training → test-set prediction → evaluation → model comparison → marketing interpretation.
+
+## Train-test split
+
+```{r split}
+set.seed(123)
+train_index <- caret::createDataPartition(bank$y, p = 0.70, list = FALSE)
+train_data <- bank[train_index, , drop = FALSE]
+test_data  <- bank[-train_index, , drop = FALSE]
+
+cat("Training rows:", nrow(train_data), "\n")
+cat("Testing rows:", nrow(test_data), "\n")
+cat("Training target proportions:\n")
+print(prop.table(table(train_data$y)))
+cat("Testing target proportions:\n")
+print(prop.table(table(test_data$y)))
+```
+
+## Model 1: Logistic Regression
+
+Logistic Regression is a baseline classifier that estimates the probability of subscription. Its coefficients can help explain the direction of associations, although categorical coding and other variables affect interpretation.
+
+```{r logistic-model}
+logit_model <- glm(y ~ ., data = train_data, family = binomial())
+summary(logit_model)
+```
+
+## Model 2: Decision Tree
+
+A Decision Tree creates a sequence of feature-based splits. It can be visualised as readable decision rules, but a deep tree can overfit.
+
+```{r tree-model}
+tree_model <- rpart(y ~ ., data = train_data, method = "class",
+                    control = rpart.control(cp = 0.01, maxdepth = 8))
+printcp(tree_model)
+```
+
+```{r tree-plot}
+rpart.plot::rpart.plot(tree_model, type = 2, extra = 104,
+                       fallen.leaves = TRUE, main = "Decision Tree")
+```
+
+## Model 3: Random Forest
+
+Random Forest combines many decision trees trained with randomised samples and feature selection. It can model non-linear relationships, although it is less directly interpretable than a single tree.
+
+```{r random-forest}
+set.seed(123)
+rf_model <- randomForest(y ~ ., data = train_data,
+                         ntree = 300, importance = TRUE)
+print(rf_model)
+```
+
+# Model evaluation
+
+Each model is evaluated on the held-out test data. The positive class is `yes`, because the practical goal is to identify likely subscribers.
+
+## Predictions and metrics
+
+```{r evaluation-functions}
+get_metrics <- function(actual, predicted, probability, model_name) {
+  actual <- factor(actual, levels = c("no", "yes"))
+  predicted <- factor(predicted, levels = c("no", "yes"))
+
+  cm <- caret::confusionMatrix(data = predicted, reference = actual,
+                               positive = "yes")
+  precision <- unname(cm$byClass["Precision"])
+  recall <- unname(cm$byClass["Recall"])
+  f1 <- if (is.finite(precision) && is.finite(recall) &&
+            (precision + recall) > 0) {
+    2 * precision * recall / (precision + recall)
+  } else {
+    NA_real_
+  }
+  roc_obj <- pROC::roc(response = actual, predictor = as.numeric(probability),
+                       levels = c("no", "yes"), direction = "<", quiet = TRUE)
+
+  list(
+    model = model_name,
+    confusion = cm,
+    metrics = data.frame(
+      Model = model_name,
+      Accuracy = unname(cm$overall["Accuracy"]),
+      Precision = precision,
+      Recall = recall,
+      F1 = f1,
+      ROC_AUC = as.numeric(pROC::auc(roc_obj))
+    ),
+    roc = roc_obj
+  )
+}
+
+# Logistic Regression probability and class predictions.
+logit_prob <- predict(logit_model, newdata = test_data, type = "response")
+logit_pred <- factor(ifelse(logit_prob >= 0.5, "yes", "no"),
+                     levels = c("no", "yes"))
+
+# Decision Tree probabilities.
+tree_prob <- predict(tree_model, newdata = test_data, type = "prob")[, "yes"]
+tree_pred <- factor(ifelse(tree_prob >= 0.5, "yes", "no"),
+                    levels = c("no", "yes"))
+
+# Random Forest probabilities.
+rf_prob <- predict(rf_model, newdata = test_data, type = "prob")[, "yes"]
+rf_pred <- factor(ifelse(rf_prob >= 0.5, "yes", "no"),
+                  levels = c("no", "yes"))
+
+eval_logit <- get_metrics(test_data$y, logit_pred, logit_prob, "Logistic Regression")
+eval_tree  <- get_metrics(test_data$y, tree_pred, tree_prob, "Decision Tree")
+eval_rf    <- get_metrics(test_data$y, rf_pred, rf_prob, "Random Forest")
+
+knitr::kable(eval_logit$confusion$table, caption = "Logistic Regression confusion matrix")
+knitr::kable(eval_tree$confusion$table, caption = "Decision Tree confusion matrix")
+knitr::kable(eval_rf$confusion$table, caption = "Random Forest confusion matrix")
+
+results <- bind_rows(eval_logit$metrics, eval_tree$metrics, eval_rf$metrics) %>%
+  arrange(desc(F1), desc(ROC_AUC))
+knitr::kable(results, digits = 3,
+             caption = "Test-set comparison (values calculated when the report is knitted)")
+```
+
+## Understanding the metrics
+
+| Metric | Meaning |
+|---|---|
+| Accuracy | Share of all predictions that are correct |
+| Precision | Of customers predicted `yes`, the share who actually subscribed |
+| Recall | Of actual subscribers, the share identified by the model |
+| F1-score | Harmonic mean of precision and recall |
+| ROC-AUC | How well the model separates the two classes across thresholds |
+
+Accuracy should not be considered alone. When `no` is much more common than `yes`, a model can achieve apparently good accuracy while failing to identify many subscribers. Precision and recall help describe this trade-off.
+
+## ROC curves
+
+```{r roc-plot}
+plot(eval_logit$roc, col = "navy", lwd = 2,
+     main = "ROC curves on the held-out test set")
+plot(eval_tree$roc, col = "darkorange", lwd = 2, add = TRUE)
+plot(eval_rf$roc, col = "darkgreen", lwd = 2, add = TRUE)
+abline(a = 0, b = 1, lty = 2, col = "grey50")
+legend("bottomright",
+       legend = c(
+         paste0("Logistic Regression (AUC = ", round(results$ROC_AUC[match("Logistic Regression", results$Model)], 3), ")"),
+         paste0("Decision Tree (AUC = ", round(results$ROC_AUC[match("Decision Tree", results$Model)], 3), ")"),
+         paste0("Random Forest (AUC = ", round(results$ROC_AUC[match("Random Forest", results$Model)], 3), ")")
+       ),
+       col = c("navy", "darkorange", "darkgreen"), lwd = 2, cex = 0.8)
+```
+
+## Selecting a model
+
+The table is sorted by F1-score and then ROC-AUC. Treat this as a starting point, not an automatic business decision. The final choice should consider the cost of missed subscribers, false-positive calls, interpretability and operational constraints.
+
+```{r best-model}
+best_model_name <- results$Model[1]
+cat("Top-ranked model by F1, then ROC-AUC:", best_model_name, "\n")
+```
+
+# Feature importance
+
+Random Forest variable importance can help identify which features the model relied on. Importance is predictive association, not proof of causation.
+
+```{r feature-importance}
+importance_df <- as.data.frame(randomForest::importance(rf_model))
+importance_df$Feature <- rownames(importance_df)
+importance_col <- if ("%IncMSE" %in% names(importance_df)) "%IncMSE" else names(importance_df)[1]
+importance_df <- importance_df %>%
+  arrange(desc(.data[[importance_col]])) %>%
+  slice_head(n = 10)
+
+ggplot(importance_df, aes(x = reorder(Feature, .data[[importance_col]]),
+                          y = .data[[importance_col]])) +
+  geom_col(fill = "#13808B") +
+  coord_flip() +
+  labs(title = "Top Random Forest feature-importance scores",
+       x = "Feature", y = importance_col) +
+  theme_minimal()
+
+knitr::kable(importance_df, digits = 3,
+             caption = "Top feature-importance values from Random Forest")
+```
+
+# Business interpretation
+
+If validated on suitable data, a model could assign each customer a probability of subscription and rank prospects from higher to lower likelihood. A bank marketing team could use that ranking to plan campaign priorities rather than treating every customer identically.
+
+| Model output | Possible business use |
+|---|---|
+| Predicted subscription probability | Rank prospects by estimated likelihood |
+| Test-set evaluation metrics | Understand strengths and weaknesses before use |
+| Feature-importance summary | Guide further investigation of campaign patterns |
+| EDA charts | Support evidence-based discussion of customer segments |
+
+The model should support human decision-making rather than guarantee that an individual customer will subscribe.
+
+# Limitations
+
+- The data comes from one Portuguese banking institution and may not generalise to other banks or countries.
+- Historical campaign decisions can introduce selection bias.
+- The data reflects a particular time period; customer behaviour and economic conditions can change.
+- The target class may be imbalanced, affecting detection of subscribers.
+- Predictions are probabilistic and should not be interpreted as guarantees.
+- `duration` is unavailable before a call, so it is excluded from the primary pre-call model.
+- This analysis does not implement a live CRM integration or production banking system.
+
+# Future scope
+
+1. Tune model parameters using cross-validation.
+2. Evaluate threshold choices based on campaign costs and recall requirements.
+3. Explore training-only resampling or cost-sensitive learning for class imbalance.
+4. Compare additional algorithms such as KNN or gradient boosting.
+5. Package the selected model in a simple R Shiny application after further validation.
+6. Monitor model performance over time before operational use.
+
+# Conclusion
+
+This project presents an end-to-end R workflow for predicting term-deposit subscriptions from historical bank-marketing data. It combines data preparation, exploratory plots, three classification approaches and test-set evaluation. The final report calculates performance from the supplied CSV when knitted, allowing the model comparison and conclusions to be based on actual results rather than assumed values.
+
+# References
+
+1. Moro, S., Cortez, P., & Rita, P. (2014). *A Data-Driven Approach to Predict the Success of Bank Telemarketing*. Decision Support Systems, 62, 22–31.
+2. UCI Machine Learning Repository. *Bank Marketing Data Set*.
+3. R Core Team. *R: A Language and Environment for Statistical Computing*.
+4. Kuhn, M. (2008). *Building Predictive Models in R Using the caret Package*. Journal of Statistical Software.

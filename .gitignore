@@ -1,0 +1,17 @@
+# Data files that can be re-downloaded
+# data/bank-full.csv
+
+# R environments
+.Rhistory
+.RData
+.Ruserdata
+
+# Python / Jupyter
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+
+# OS generated files
+Thumbs.db
+Desktop.ini
+.DS_Store
